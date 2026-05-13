@@ -13,7 +13,6 @@ on:
 
 permissions:
   contents: write
-  workflows: write
 
 env:
   UPSTREAM_REPO: MetaCubeX/mihomo
@@ -29,7 +28,7 @@ jobs:
         with:
           ref: ${{ env.TARGET_BRANCH }}
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.GH_PAT }}
 
       - name: Configure Git
         run: |
