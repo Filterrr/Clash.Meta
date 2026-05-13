@@ -6,14 +6,8 @@ cd "$REPO_ROOT"
 
 echo "==> [1/7] Replacing CMFA feature flags with Android feature flags"
 
-if [ -f constant/features/cmfa.go ]; then
-    rm constant/features/cmfa.go
-    echo "    Removed constant/features/cmfa.go"
-fi
-if [ -f constant/features/cmfa_stub.go ]; then
-    rm constant/features/cmfa_stub.go
-    echo "    Removed constant/features/cmfa_stub.go"
-fi
+rm -f constant/features/cmfa.go constant/features/cmfa_stub.go
+echo "    Removed constant/features/cmfa.go and cmfa_stub.go"
 
 cat > constant/features/android.go << 'GOEOF'
 //go:build android
@@ -44,6 +38,11 @@ echo "    Patched tunnel/tunnel.go"
 sed -i 's/features\.CMFA/features.Android/g' constant/path.go
 echo "    Patched constant/path.go"
 
+sed -i 's/if features\.CMFA {/if features.Android {/' constant/features/tags.go
+sed -i 's/"cmfa"/"android"/g' constant/features/tags.go
+sed -i 's/CMFA/Android/g' constant/features/tags.go
+echo "    Patched constant/features/tags.go"
+
 echo "==> [3/7] Updating build tags from 'android && cmfa' to 'android'"
 
 sed -i 's|//go:build android && cmfa|//go:build android|g' dns/patch_android.go
@@ -57,10 +56,8 @@ echo "    Patched dns/system_common.go build tag"
 
 echo "==> [4/7] Replacing upstream CMFA-specific files with FlClash versions"
 
-if [ -f listener/sing_tun/server_notandroid.go ]; then
-    rm listener/sing_tun/server_notandroid.go
-    echo "    Removed listener/sing_tun/server_notandroid.go"
-fi
+rm -f listener/sing_tun/server_notandroid.go
+echo "    Removed listener/sing_tun/server_notandroid.go"
 
 cat > listener/sing_tun/server_android.go << 'GOEOF'
 //go:build android
@@ -77,34 +74,18 @@ func (l *Listener) buildAndroidRules(tunOptions *tun.Options) error {
 GOEOF
 echo "    Rewrote listener/sing_tun/server_android.go (simplified for FlClash)"
 
-sed -i '/err = l\.buildAndroidRules(&tunOptions)/,/return$/d' listener/sing_tun/server.go 2>/dev/null || true
-if ! grep -q 'buildAndroidRules' listener/sing_tun/server.go; then
-    sed -i '/tunOptions\.Inet4AddressOverride = tunOptions\.Inet4Address/a\\n\terr = l.buildAndroidRules(\&tunOptions)\n\tif err != nil {\n\t\terr = E.Cause(err, "build android rules")\n\t\treturn\n\t}' listener/sing_tun/server.go 2>/dev/null || true
-fi
-
 echo "==> [5/7] Patching existing upstream files for FlClash adaptation"
 
-sed -i 's/if features\.CMFA {/if features.Android {/g' constant/features/tags.go 2>/dev/null || true
-sed -i '/if features\.Android {/,/}/s/CMFA/Android/' constant/features/tags.go 2>/dev/null || true
-sed -i 's/"cmfa"/"android"/g' constant/features/tags.go
-echo "    Patched constant/features/tags.go"
-
 sed -i 's/if p\.allowUnsafePath || features\.CMFA/if p.allowUnsafePath || features.Android/' constant/path.go
-echo "    Patched constant/path.go (features.CMFA -> features.Android)"
+echo "    Patched constant/path.go (features.CMFA -> features.Android in allowUnsafePath)"
 
-if ! grep -q 'GEOIP.metadb' constant/path.go; then
-    sed -i '/strings\.EqualFold(fi\.Name(), "geoip\.metadb")/a\\t\t\t\tstrings.EqualFold(fi.Name(), "GEOIP.metadb") ||' constant/path.go
-fi
-if ! grep -q 'GEOIP.dat' constant/path.go; then
-    sed -i '/strings\.EqualFold(fi\.Name(), "GeoIP\.dat")/a\\t\t\t\tstrings.EqualFold(fi.Name(), "GEOIP.dat") ||' constant/path.go
-fi
-if ! grep -q 'GEOSITE.dat' constant/path.go; then
-    sed -i '/strings\.EqualFold(fi\.Name(), "GeoSite\.dat")/a\\t\t\t\tstrings.EqualFold(fi.Name(), "GEOSITE.dat") ||' constant/path.go
-fi
+sed -i 's/strings\.EqualFold(fi\.Name(), "geoip\.metadb") {/strings.EqualFold(fi.Name(), "geoip.metadb") ||\n\t\t\t\tstrings.EqualFold(fi.Name(), "GEOIP.metadb") {/' constant/path.go
+sed -i 's/strings\.EqualFold(fi\.Name(), "GeoIP\.dat") {/strings.EqualFold(fi.Name(), "GeoIP.dat") ||\n\t\t\t\tstrings.EqualFold(fi.Name(), "GEOIP.dat") {/' constant/path.go
+sed -i 's/strings\.EqualFold(fi\.Name(), "GeoSite\.dat") {/strings.EqualFold(fi.Name(), "GeoSite.dat") ||\n\t\t\t\tstrings.EqualFold(fi.Name(), "GEOSITE.dat") {/' constant/path.go
 echo "    Patched constant/path.go (added uppercase geo filename variants)"
 
-sed -i 's/never change type traits because.*used in CFMA/never change type traits because it'\''s used in CMFA/' component/process/process.go 2>/dev/null || true
-echo "    Patched component/process/process.go (typo fix)"
+sed -i "s/never change type traits because.*used in CFMA/never change type traits because it's used in CMFA/" component/process/process.go
+echo "    Patched component/process/process.go (typo fix CFMA -> CMFA)"
 
 sed -i 's/log\.Errorln("\[Provider\]/log.Warnln("[Provider]/g' component/resource/fetcher.go
 echo "    Patched component/resource/fetcher.go (Errorln -> Warnln for provider errors)"
@@ -113,40 +94,45 @@ sed -i 's/log\.Errorln("initial proxy provider/log.Warnln("initial proxy provide
 sed -i 's/log\.Errorln("initial rule provider/log.Warnln("initial rule provider/g' hub/executor/executor.go
 echo "    Patched hub/executor/executor.go (Errorln -> Warnln for provider init errors)"
 
-sed -i 's/updateListeners(cfg\.General, cfg\.Listeners, force)/\/\/updateListeners(cfg.General, cfg.Listeners, force)/' hub/executor/executor.go
-sed -i 's/updateTun(cfg\.General)/\/\/updateTun(cfg.General)/' hub/executor/executor.go
+sed -i 's/^\tupdateListeners(cfg\.General, cfg\.Listeners, force)/\t\/\/updateListeners(cfg.General, cfg.Listeners, force)/' hub/executor/executor.go
+sed -i 's/^\tupdateTun(cfg\.General)/\t\/\/updateTun(cfg.General)/' hub/executor/executor.go
 echo "    Patched hub/executor/executor.go (commented out updateListeners and updateTun)"
 
-if grep -q 'wg\.Wait()' hub/executor/executor.go; then
-    sed -i '/wg\.Wait()/d' hub/executor/executor.go
-    echo "    Removed wg.Wait() from hub/executor/executor.go"
-fi
+sed -i '/^\twg\.Wait()$/d' hub/executor/executor.go
+echo "    Removed wg.Wait() from hub/executor/executor.go"
 
-sed -i 's/if err = server\.Serve(l); err != nil {/_ = server.Serve(l)/' hub/route/server.go
-sed -i '/log\.Errorln("External controller serve error: %s", err)/d' hub/route/server.go
-if grep -q '_ = server.Serve(l)' hub/route/server.go; then
-    :
-else
+sed -i '/if err = server\.Serve(l); err != nil {/{
+N
+s/if err = server\.Serve(l); err != nil {\n\t\tlog\.Errorln("External controller serve error: %s", err)/_ = server.Serve(l)/
+}' hub/route/server.go
+if grep -q 'if err = server.Serve(l); err != nil' hub/route/server.go; then
     sed -i 's/if err = server\.Serve(l); err != nil {/_ = server.Serve(l)/' hub/route/server.go
+    sed -i '/log\.Errorln("External controller serve error: %s", err)/d' hub/route/server.go
+    sed -i '/^}$/d' hub/route/server.go
 fi
 echo "    Patched hub/route/server.go (ignore Serve error)"
 
-sed -i 's/if tunConf\.Equal(LastTunConf) {/if tunLister != nil \&\& tunConf.Equal(LastTunConf) {/' listener/listener.go
-sed -i '/if tunLister != nil {/d' listener/listener.go
-sed -i '/tunLister\.OnReload()/d' listener/listener.go
-if ! grep -q 'tunLister.OnReload()' listener/listener.go; then
-    sed -i 's/if tunLister != nil && tunConf\.Equal(LastTunConf) {/if tunLister != nil \&\& tunConf.Equal(LastTunConf) {\n\t\ttunLister.OnReload()/' listener/listener.go
+sed -i '/if tunConf\.Equal(LastTunConf) {/{
+N
+N
+s/if tunConf\.Equal(LastTunConf) {\n\t\tif tunLister != nil {\n\t\t\ttunLister\.OnReload()/if tunLister != nil \&\& tunConf.Equal(LastTunConf) {\n\t\ttunLister.OnReload()/
+}' listener/listener.go
+if grep -q 'if tunConf.Equal(LastTunConf) {' listener/listener.go; then
+    sed -i '/if tunConf\.Equal(LastTunConf) {/,/}/{
+        /if tunLister != nil {/d
+        /tunLister\.OnReload/d
+        s/if tunConf\.Equal(LastTunConf) {/if tunLister != nil \&\& tunConf.Equal(LastTunConf) {\n\t\ttunLister.OnReload()/
+    }' listener/listener.go
 fi
 echo "    Patched listener/listener.go (tunLister nil check reorder)"
 
-if grep -q 'var DefaultTestURL = ' constant/adapters.go; then
+if grep -q '^var DefaultTestURL = ' constant/adapters.go; then
     sed -i '/^var DefaultTestURL = /d' constant/adapters.go
-    sed -i 's/DefaultTestURL[[:space:]]*=/DefaultTestURL =/' constant/adapters.go 2>/dev/null || true
 fi
-echo "    Patched constant/adapters.go (DefaultTestURL moved to const block)"
+echo "    Patched constant/adapters.go (removed duplicate DefaultTestURL var declaration)"
 
 sed -i 's/if !features\.CMFA {/if !features.Android {/' tunnel/tunnel.go
-echo "    Patched tunnel/tunnel.go (features.CMFA -> features.Android)"
+echo "    Patched tunnel/tunnel.go (features.CMFA -> features.Android in process finder)"
 
 echo "==> [6/7] Creating FlClash-specific patch files"
 
@@ -160,9 +146,11 @@ GOEOF
 echo "    Created adapter/patch.go"
 
 if ! grep -q 'UrlTestHook' adapter/adapter.go; then
-    sed -i '/URLTest\(ctx context.Context, url string, expectedStatus/i\\tif UrlTestHook != nil {\n\t\tUrlTestHook(url, p.Name(), t)\n\t}\n' adapter/adapter.go
+    sed -i '/func (p \*Proxy) URLTest/,/var satisfied bool/{
+        /var satisfied bool/i\\tif UrlTestHook != nil {\n\t\tUrlTestHook(url, p.Name(), t)\n\t}\n
+    }' adapter/adapter.go
 fi
-echo "    Patched adapter/adapter.go (added UrlTestHook call)"
+echo "    Patched adapter/adapter.go (added UrlTestHook call before var satisfied)"
 
 cat > adapter/provider/patch.go << 'GOEOF'
 package provider
@@ -281,7 +269,7 @@ GOEOF
 echo "    Created config/patch.go"
 
 if ! grep -q 'SetProxyNameList' config/config.go; then
-    sed -i '/proxies = list/a\\tSetProxyNameList(proxyList)' config/config.go 2>/dev/null || true
+    sed -i '/return proxies, providersMap, nil/i\\tSetProxyNameList(proxyList)' config/config.go
 fi
 echo "    Patched config/config.go (added SetProxyNameList call)"
 
@@ -295,7 +283,10 @@ GOEOF
 echo "    Created hub/executor/patch.go"
 
 if ! grep -q 'DefaultProviderLoadedHook' hub/executor/executor.go; then
-    sed -i '/log.Warnln("initial proxy provider %s error: %v", name, err)/a\\t\t} else {\n\t\t\tif DefaultProviderLoadedHook != nil {\n\t\t\t\tDefaultProviderLoadedHook(name)\n\t\t\t}' hub/executor/executor.go
+    sed -i '/log.Warnln("initial rule provider %s error: %v", name, err)/{
+        n
+        s/}/} else {\n\t\t\tif DefaultProviderLoadedHook != nil {\n\t\t\t\tDefaultProviderLoadedHook(name)\n\t\t\t}/
+    }' hub/executor/executor.go
 fi
 echo "    Patched hub/executor/executor.go (added ProviderLoadedHook call)"
 
@@ -424,7 +415,7 @@ GOEOF
 echo "    Created tunnel/patch.go"
 
 if ! grep -q 'UpdateAllProxies' tunnel/tunnel.go; then
-    sed -i '/UpdateTun()/a\\tUpdateAllProxies(newProxies, newProviders)' tunnel/tunnel.go
+    sed -i '/providers = newProviders/a\\tUpdateAllProxies(newProxies, newProviders)' tunnel/tunnel.go
 fi
 echo "    Patched tunnel/tunnel.go (added UpdateAllProxies call)"
 
@@ -494,32 +485,47 @@ echo "    Created rules/provider/patch_android.go"
 
 echo "==> [7/7] Patching traffic statistics for proxy-only tracking"
 
-if ! grep -q 'proxyUploadTemp' tunnel/statistic/manager.go; then
-    sed -i '/downloadTotal.*atomic\.Int64/a\\tproxyUploadTemp    atomic.Int64\n\tproxyDownloadTemp  atomic.Int64\n\tproxyUploadBlip    atomic.Int64\n\tproxyDownloadBlip  atomic.Int64\n\tproxyUploadTotal   atomic.Int64\n\tproxyDownloadTotal atomic.Int64' tunnel/statistic/manager.go
-fi
-echo "    Added proxy traffic fields to manager.go"
-
-if ! grep -q 'DefaultRequestNotify' tunnel/statistic/manager.go; then
-    sed -i '/manager.Join(c)/i\\tif DefaultRequestNotify != nil {\n\t\tDefaultRequestNotify(c)\n\t}' tunnel/statistic/manager.go
-fi
-echo "    Added DefaultRequestNotify call to manager.go"
+sed -i '/downloadTotal.*atomic\.Int64/a\\tproxyUploadTemp    atomic.Int64\n\tproxyDownloadTemp  atomic.Int64\n\tproxyUploadBlip    atomic.Int64\n\tproxyDownloadBlip  atomic.Int64\n\tproxyUploadTotal   atomic.Int64\n\tproxyDownloadTotal atomic.Int64' tunnel/statistic/manager.go
+echo "    Added proxy traffic fields to Manager struct"
 
 sed -i 's/func (m \*Manager) PushUploaded(size int64)/func (m *Manager) PushUploaded(lastChain string, size int64)/' tunnel/statistic/manager.go
 sed -i 's/func (m \*Manager) PushDownloaded(size int64)/func (m *Manager) PushDownloaded(lastChain string, size int64)/' tunnel/statistic/manager.go
+echo "    Changed PushUploaded/PushDownloaded signatures"
 
-if ! grep -q 'proxyUploadTemp' tunnel/statistic/manager.go || ! grep -q 'lastChain' tunnel/statistic/manager.go; then
-    echo "    WARNING: Could not fully patch PushUploaded/PushDownloaded signatures, manual review needed"
+sed -i '/func (m \*Manager) PushUploaded(lastChain string, size int64)/,/func (m \*Manager) PushDownloaded/{
+    /m\.uploadTemp\.Add(size)/i\\tif lastChain != "DIRECT" {\n\t\tm.proxyUploadTemp.Add(size)\n\t\tm.proxyUploadTotal.Add(size)\n\t}
+}' tunnel/statistic/manager.go
+
+sed -i '/func (m \*Manager) PushDownloaded(lastChain string, size int64)/,/^}/{
+    /m\.downloadTemp\.Add(size)/i\\tif lastChain != "DIRECT" {\n\t\tm.proxyDownloadTemp.Add(size)\n\t\tm.proxyDownloadTotal.Add(size)\n\t}
+}' tunnel/statistic/manager.go
+echo "    Added proxy-only traffic tracking logic"
+
+sed -i '/m\.downloadTotal\.Store(0)/a\\n\tm.proxyUploadTemp.Store(0)\n\tm.proxyUploadBlip.Store(0)\n\tm.proxyUploadTotal.Store(0)\n\tm.proxyDownloadTemp.Store(0)\n\tm.proxyDownloadBlip.Store(0)\n\tm.proxyDownloadTotal.Store(0)' tunnel/statistic/manager.go
+echo "    Added proxy traffic reset in ResetStatistic"
+
+sed -i '/m\.downloadBlip\.Store(m\.downloadTemp\.Swap(0))/a\\n\tm.proxyUploadBlip.Store(m.proxyUploadTemp.Swap(0))\n\tm.proxyDownloadBlip.Store(m.proxyDownloadTemp.Swap(0))' tunnel/statistic/manager.go
+echo "    Added proxy traffic blip in handle()"
+
+if ! grep -q 'DefaultRequestNotify' tunnel/statistic/manager.go; then
+    sed -i '/func (m \*Manager) Join/,/m\.connections\.Store/{
+        /m\.connections\.Store/i\\tif DefaultRequestNotify != nil {\n\t\tDefaultRequestNotify(c)\n\t}\n
+    }' tunnel/statistic/manager.go
 fi
+echo "    Added DefaultRequestNotify call in Join()"
 
-sed -i 's/m\.PushUploaded(upload)/m.PushUploaded("", upload)/g' tunnel/statistic/manager.go 2>/dev/null || true
-sed -i 's/m\.PushDownloaded(download)/m.PushDownloaded("", download)/g' tunnel/statistic/manager.go 2>/dev/null || true
-echo "    Patched PushUploaded/PushDownloaded in manager.go"
-
-sed -i 's/manager\.PushUploaded(uploadTotal)/manager.PushUploaded("", uploadTotal)/g' tunnel/statistic/tracker.go 2>/dev/null || true
-sed -i 's/manager\.PushDownloaded(downloadTotal)/manager.PushDownloaded("", downloadTotal)/g' tunnel/statistic/tracker.go 2>/dev/null || true
-sed -i 's/manager\.PushUploaded(upload)/manager.PushUploaded("", upload)/g' tunnel/statistic/tracker.go 2>/dev/null || true
-sed -i 's/manager\.PushDownloaded(download)/manager.PushDownloaded("", download)/g' tunnel/statistic/tracker.go 2>/dev/null || true
-echo "    Patched PushUploaded/PushDownloaded calls in tracker.go"
+sed -i 's/tt\.manager\.PushDownloaded(download)/tt.manager.PushDownloaded(tt.Conn.Chains().Last(), download)/g' tunnel/statistic/tracker.go
+sed -i 's/tt\.manager\.PushUploaded(upload)/tt.manager.PushUploaded(tt.Conn.Chains().Last(), upload)/g' tunnel/statistic/tracker.go
+sed -i 's/ut\.manager\.PushDownloaded(download)/ut.manager.PushDownloaded(ut.Chains().Last(), download)/g' tunnel/statistic/tracker.go
+sed -i 's/ut\.manager\.PushUploaded(upload)/ut.manager.PushUploaded(ut.Chains().Last(), upload)/g' tunnel/statistic/tracker.go
+sed -i 's/manager\.PushUploaded(uploadTotal)/manager.PushUploaded(tt.Conn.Chains().Last(), uploadTotal)/g' tunnel/statistic/tracker.go
+sed -i 's/manager\.PushDownloaded(downloadTotal)/manager.PushDownloaded(tt.Conn.Chains().Last(), downloadTotal)/g' tunnel/statistic/tracker.go
+sed -i 's/\bt := &tcpTracker{/tt := \&tcpTracker{/' tunnel/statistic/tracker.go
+sed -i 's/t\.TrackerInfo\.Rule/tt.TrackerInfo.Rule/g' tunnel/statistic/tracker.go
+sed -i 's/t\.TrackerInfo\.RulePayload/tt.TrackerInfo.RulePayload/g' tunnel/statistic/tracker.go
+sed -i 's/manager\.Join(t)/manager.Join(tt)/g' tunnel/statistic/tracker.go
+sed -i 's/return t$/return tt/' tunnel/statistic/tracker.go
+echo "    Patched tracker.go (added chain name to PushUploaded/PushDownloaded calls, renamed t -> tt)"
 
 echo ""
 echo "==> All FlClash patches applied successfully!"
