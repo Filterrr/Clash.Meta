@@ -1,0 +1,103 @@
+name: Sync Upstream & Patch for FlClash
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      force_sync:
+        description: 'Force sync even if no new upstream commits'
+        required: false
+        default: 'false'
+        type: boolean
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: MetaCubeX/mihomo
+  UPSTREAM_BRANCH: Alpha
+  TARGET_BRANCH: Alpha
+
+jobs:
+  sync-and-patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git 2>/dev/null || true
+          git fetch upstream ${{ env.UPSTREAM_BRANCH }}
+
+      - name: Check for upstream changes
+        id: check_changes
+        run: |
+          LOCAL_HASH=$(git rev-parse HEAD)
+          UPSTREAM_HASH=$(git rev-parse upstream/${{ env.UPSTREAM_BRANCH }})
+
+          echo "local_hash=$LOCAL_HASH" >> $GITHUB_OUTPUT
+          echo "upstream_hash=$UPSTREAM_HASH" >> $GITHUB_OUTPUT
+
+          if [ "$LOCAL_HASH" = "$UPSTREAM_HASH" ] && [ "${{ github.event.inputs.force_sync }}" != "true" ]; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "No new upstream commits detected."
+          else
+            COMMIT_COUNT=$(git rev-list --count HEAD..upstream/${{ env.UPSTREAM_BRANCH }})
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "Found $COMMIT_COUNT new upstream commit(s)."
+          fi
+
+      - name: Merge upstream changes
+        if: steps.check_changes.outputs.has_changes == 'true'
+        run: |
+          git merge upstream/${{ env.UPSTREAM_BRANCH }} --no-edit \
+            -m "chore: sync upstream ${{ env.UPSTREAM_REPO }}@${{ steps.check_changes.outputs.upstream_hash }}"
+
+      - name: Apply FlClash patches
+        if: steps.check_changes.outputs.has_changes == 'true' || github.event.inputs.force_sync == 'true'
+        run: |
+          python3 scripts/patch-for-flclash.py
+
+      - name: Verify Go build
+        if: steps.check_changes.outputs.has_changes == 'true' || github.event.inputs.force_sync == 'true'
+        run: |
+          go version
+          go build -v ./...
+
+      - name: Commit and push changes
+        if: steps.check_changes.outputs.has_changes == 'true' || github.event.inputs.force_sync == 'true'
+        run: |
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No patch changes to commit (patches already applied)."
+          else
+            git commit -m "chore: apply FlClash adaptation patches
+
+            - Replace CMFA feature flags with Android feature flags
+            - Add FlClash-specific API exposure (patch files)
+            - Adapt build tags from 'cmfa' to 'android'
+            - Add proxy-only traffic tracking
+            - Expose updater, config, listener, and tunnel APIs"
+          fi
+          git push origin ${{ env.TARGET_BRANCH }}
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Sync Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Upstream**: \`${{ env.UPSTREAM_REPO }}\` (\`${{ env.UPSTREAM_BRANCH }}\` branch)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Local hash**: \`${{ steps.check_changes.outputs.local_hash }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Upstream hash**: \`${{ steps.check_changes.outputs.upstream_hash }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Changes found**: ${{ steps.check_changes.outputs.has_changes }}" >> $GITHUB_STEP_SUMMARY
