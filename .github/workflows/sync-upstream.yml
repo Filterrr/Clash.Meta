@@ -67,8 +67,7 @@ jobs:
       - name: Apply FlClash patches
         if: steps.check_changes.outputs.has_changes == 'true' || github.event.inputs.force_sync == 'true'
         run: |
-          chmod +x scripts/patch-for-flclash.sh
-          bash scripts/patch-for-flclash.sh
+          python3 scripts/patch-for-flclash.py
 
       - name: Verify Go build
         if: steps.check_changes.outputs.has_changes == 'true' || github.event.inputs.force_sync == 'true'
