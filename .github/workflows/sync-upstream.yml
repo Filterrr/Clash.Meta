@@ -16,8 +16,8 @@ permissions:
 
 env:
   UPSTREAM_REPO: MetaCubeX/mihomo
-  UPSTREAM_BRANCH: Alpha
-  TARGET_BRANCH: Alpha
+  UPSTREAM_BRANCH: Meta
+  TARGET_BRANCH: Meta
 
 jobs:
   sync-and-patch:
@@ -61,8 +61,30 @@ jobs:
       - name: Merge upstream changes
         if: steps.check_changes.outputs.has_changes == 'true'
         run: |
-          git merge upstream/${{ env.UPSTREAM_BRANCH }} --no-edit \
-            -m "chore: sync upstream ${{ env.UPSTREAM_REPO }}@${{ steps.check_changes.outputs.upstream_hash }}"
+          if ! git merge upstream/${{ env.UPSTREAM_BRANCH }} --no-edit \
+            -m "chore: sync upstream ${{ env.UPSTREAM_REPO }}@${{ steps.check_changes.outputs.upstream_hash }}"; then
+            echo "Merge conflicts detected, resolving..."
+            CONFLICTED=$(git diff --name-only --diff-filter=U)
+            echo "Conflicted files: $CONFLICTED"
+            for file in $CONFLICTED; do
+              case "$file" in
+                go.mod|go.sum)
+                  echo "Resolving conflict in $file: accepting upstream version"
+                  git checkout --theirs "$file"
+                  git add "$file"
+                  ;;
+                *)
+                  echo "ERROR: Unresolvable conflict in $file"
+                  git diff --name-only --diff-filter=U
+                  exit 1
+                  ;;
+              esac
+            done
+            echo "Running 'go mod tidy' to regenerate go.sum..."
+            go mod tidy
+            git add go.mod go.sum
+            git commit --no-edit
+          fi
 
       - name: Write patch script
         run: |
