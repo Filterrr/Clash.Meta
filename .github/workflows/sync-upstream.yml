@@ -16,8 +16,8 @@ permissions:
 
 env:
   UPSTREAM_REPO: MetaCubeX/mihomo
-  UPSTREAM_BRANCH: Meta
-  TARGET_BRANCH: Meta
+  UPSTREAM_BRANCH: Alpha
+  TARGET_BRANCH: Alpha
 
 jobs:
   sync-and-patch:
