@@ -966,17 +966,6 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 		return nil, nil, err
 	}
 
-	SetProxyNameList(proxyList)
-	SetProxyNameList(proxyList)
-
-	SetProxyNameList(proxyList)
-	SetProxyNameList(proxyList)
-	SetProxyNameList(proxyList)
-	SetProxyNameList(proxyList)
-	SetProxyNameList(proxyList)
-	SetProxyNameList(proxyList)
-	SetProxyNameList(proxyList)
-	SetProxyNameList(proxyList)
 	return proxies, providersMap, nil
 }
 
