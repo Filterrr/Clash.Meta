@@ -332,11 +332,14 @@ func SetProxyNameList(list []string) {
 print("    Created config/patch.go")
 
 content = read("config/config.go")
-content = content.replace(
-    '\treturn proxies, providersMap, nil',
-    '\tSetProxyNameList(proxyList)\n\treturn proxies, providersMap, nil')
-write("config/config.go", content)
-print("    Patched config/config.go (added SetProxyNameList call)")
+if 'SetProxyNameList(proxyList)' not in content:
+    content = content.replace(
+        '\treturn proxies, providersMap, nil',
+        '\tSetProxyNameList(proxyList)\n\treturn proxies, providersMap, nil')
+    write("config/config.go", content)
+    print("    Patched config/config.go (added SetProxyNameList call)")
+else:
+    print("    Skipped config/config.go (SetProxyNameList already present)")
 
 write("hub/executor/patch.go", """\
 package executor
