@@ -29,10 +29,11 @@ const (
 	quicWaitConn = time.Second * 3
 
 	// maxCryptoStreamOffset bounds both the highest Initial CRYPTO stream offset
-	// accepted by the sniffer and its per-connection reassembly memory. 64 KiB
-	// matches the TCP sniffing budget and the largest pooled buffer, and aligns
-	// with the Initial CRYPTO limits used by ngtcp2 and Cloudflare quiche while
-	// remaining more permissive than the 16 KiB limits in quic-go and BoringSSL.
+	// and the payload retained by the sniffer. Its coverage bitmap uses at most
+	// another 8 KiB. The 64 KiB payload budget matches TCP sniffing and the
+	// largest pooled buffer, and aligns with the Initial CRYPTO limits used by
+	// ngtcp2 and Cloudflare quiche while remaining more permissive than the
+	// 16 KiB limits in quic-go and BoringSSL.
 	// This is a resource policy, not a QUIC or TLS protocol limit. For example,
 	// rustls permits a 65,535-byte Handshake payload plus its four-byte header;
 	// covering that boundary case would exceed the shared 64 KiB sniffing budget.
@@ -136,11 +137,12 @@ func (sniffer *QUICSniffer) WrapperSender(packetSender constant.PacketSender, re
 var _ constant.PacketSender = (*quicPacketSender)(nil)
 
 type quicPacketSender struct {
-	structure *quicStructure
-	lock      sync.RWMutex
-	ranges    utils.IntRanges[uint64]
-	buffer    []byte
-	result    string
+	structure           *quicStructure
+	lock                sync.RWMutex
+	buffer              []byte
+	receivedCryptoData  bitmap
+	contiguousCryptoEnd uint64
+	result              string
 
 	replaceDomain sniffer.ReplaceDomain
 
@@ -148,6 +150,8 @@ type quicPacketSender struct {
 
 	labelsOnce sync.Once
 	labels     quicLabels
+	// initialDestConnID is the DCID from which labels were derived.
+	initialDestConnID []byte
 
 	done chan struct{}
 
@@ -205,7 +209,8 @@ func (q *quicPacketSender) close() {
 			_ = pool.Put(q.buffer)
 			q.buffer = nil
 		}
-		q.ranges = nil
+		q.receivedCryptoData = bitmap{}
+		q.contiguousCryptoEnd = 0
 	}
 }
 
@@ -319,18 +324,39 @@ func (q *quicPacketSender) readQUICPacket(b []byte, coalesced bool) (int, error)
 		return packetEnd, nil
 	}
 
-	labels := q.expandLabels(destConnID, s)
+	cache := buf.NewPacket()
+	defer cache.Release()
 
-	block, err := aes.NewCipher(labels.hp)
+	labels := q.initialLabels(destConnID, s)
+	decrypted, err := decryptQUICInitialPacket(b, hdrLen, packetEnd, labels, cache)
+	if err != nil && !bytes.Equal(destConnID, q.initialDestConnID) {
+		// A Retry changes the DCID used to derive Initial keys. A regular
+		// Initial can change its header DCID without changing keys, so only
+		// retry with the current DCID after the cached keys fail. Retry keeps
+		// the TLS CRYPTO stream unchanged, so existing fragments remain valid.
+		decrypted, err = decryptQUICInitialPacket(b, hdrLen, packetEnd, expandLabels(destConnID, s), cache)
+	}
 	if err != nil {
 		return 0, err
 	}
 
-	cache := buf.NewPacket()
-	defer cache.Release()
+	if err := q.readQUICFrames(decrypted); err != nil {
+		return 0, err
+	}
+
+	return packetEnd, nil
+}
+
+// decryptQUICInitialPacket removes header protection and decrypts one Initial
+// packet with the supplied key set.
+func decryptQUICInitialPacket(b []byte, hdrLen, packetEnd int, labels quicLabels, cache *buf.Buffer) ([]byte, error) {
+	block, err := aes.NewCipher(labels.hp)
+	if err != nil {
+		return nil, err
+	}
 
 	if hdrLen+4+16 > packetEnd {
-		return 0, errNotQUIC
+		return nil, errNotQUIC
 	}
 
 	mask := cache.Extend(block.BlockSize())
@@ -353,18 +379,18 @@ func (q *quicPacketSender) readQUICPacket(b []byte, coalesced bool) (int, error)
 	}
 
 	if extHdrLen > packetEnd {
-		return 0, errNotQUIC
+		return nil, errNotQUIC
 	}
 
 	data := b[extHdrLen:packetEnd]
 
 	aesCipher, err := aes.NewCipher(labels.key)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	aead, err := cipher.NewGCM(aesCipher)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
 	// We only decrypt once, so we do not need to XOR it back.
@@ -376,14 +402,10 @@ func (q *quicPacketSender) readQUICPacket(b []byte, coalesced bool) (int, error)
 	dst := cache.Extend(len(data))
 	decrypted, err := aead.Open(dst[:0], iv, data, extHdr)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
-	if err := q.readQUICFrames(decrypted); err != nil {
-		return 0, err
-	}
-
-	return packetEnd, nil
+	return decrypted, nil
 }
 
 // readQUICFrames validates the frames allowed in an Initial packet and retains
@@ -479,8 +501,8 @@ func (q *quicPacketSender) readQUICFrames(data []byte) error {
 }
 
 // addCryptoData stores a bounded CRYPTO fragment, growing the buffer only as
-// needed and merging ranges from out-of-order, overlapping, or retransmitted
-// frames.
+// needed and tracking exact byte coverage across out-of-order, overlapping, or
+// retransmitted frames.
 func (q *quicPacketSender) addCryptoData(offset uint64, data []byte) error {
 	if len(data) == 0 {
 		return nil
@@ -506,8 +528,14 @@ func (q *quicPacketSender) addCryptoData(offset uint64, data []byte) error {
 		q.buffer = q.buffer[:end]
 	}
 	copy(q.buffer[offset:end], data)
-	q.ranges = append(q.ranges, utils.NewRange(offset, end))
-	q.ranges = q.ranges.Merge()
+
+	q.receivedCryptoData.setRange(int(offset), int(end))
+
+	// The contiguous prefix only moves forward, allowing the bitmap to skip
+	// complete words without rescanning the assembled prefix.
+	if offset <= q.contiguousCryptoEnd && end > q.contiguousCryptoEnd {
+		q.contiguousCryptoEnd = uint64(q.receivedCryptoData.firstUnset(int(q.contiguousCryptoEnd), len(q.buffer)))
+	}
 	return nil
 }
 
@@ -520,25 +548,29 @@ func (q *quicPacketSender) tryAssemble() (string, error) {
 		return "", nil
 	}
 
-	if len(q.ranges) == 0 || q.ranges[0].Start() != 0 || q.ranges[0].End() < tlsHandshakeHeaderLen {
-		// The beginning of the CRYPTO stream is still incomplete.
+	if q.contiguousCryptoEnd == 0 {
 		return "", nil
 	}
 
-	helloSize, err := clientHelloSize(q.buffer[:tlsHandshakeHeaderLen])
-	if err != nil {
-		return "", err
-	}
-	if helloSize > maxCryptoStreamOffset {
-		return "", io.ErrShortBuffer
-	}
-	if q.ranges[0].End() < uint64(helloSize) {
-		// The complete ClientHello has not arrived yet.
-		return "", nil
+	if q.contiguousCryptoEnd >= tlsHandshakeHeaderLen {
+		helloSize, err := clientHelloSize(q.buffer[:tlsHandshakeHeaderLen])
+		if err != nil {
+			return "", err
+		}
+		if helloSize > maxCryptoStreamOffset {
+			return "", io.ErrShortBuffer
+		}
 	}
 
-	domain, err := ReadClientHello(q.buffer[:helloSize])
+	domain, err := ReadClientHello(q.buffer[:q.contiguousCryptoEnd])
 	if err != nil {
+		var need *errNeedAtLeastData
+		if errors.As(err, &need) {
+			if need.length > maxCryptoStreamOffset {
+				return "", io.ErrShortBuffer
+			}
+			return "", nil
+		}
 		return "", err
 	}
 
@@ -564,20 +596,25 @@ func (q *quicPacketSender) getQUICStructure(vb []byte) (*quicStructure, error) {
 	return nil, errNotQUIC
 }
 
-func (q *quicPacketSender) expandLabels(destConnID []byte, s *quicStructure) quicLabels {
+func (q *quicPacketSender) initialLabels(destConnID []byte, s *quicStructure) quicLabels {
 	q.labelsOnce.Do(func() {
-		initialSecret := hkdf.Extract(crypto.SHA256.New, destConnID, s.initialSalt)
-		secret := hkdfExpandLabel(initialSecret, "client in", crypto.SHA256.Size())
-
-		lp := s.labelPrefix
-
-		q.labels = quicLabels{
-			hp:  hkdfExpandLabel(secret, lp+" hp", 16),
-			key: hkdfExpandLabel(secret, lp+" key", 16),
-			iv:  hkdfExpandLabel(secret, lp+" iv", 12),
-		}
+		q.initialDestConnID = bytes.Clone(destConnID)
+		q.labels = expandLabels(destConnID, s)
 	})
 	return q.labels
+}
+
+func expandLabels(destConnID []byte, s *quicStructure) quicLabels {
+	initialSecret := hkdf.Extract(crypto.SHA256.New, destConnID, s.initialSalt)
+	secret := hkdfExpandLabel(initialSecret, "client in", crypto.SHA256.Size())
+
+	lp := s.labelPrefix
+
+	return quicLabels{
+		hp:  hkdfExpandLabel(secret, lp+" hp", 16),
+		key: hkdfExpandLabel(secret, lp+" key", 16),
+		iv:  hkdfExpandLabel(secret, lp+" iv", 12),
+	}
 }
 
 func hkdfExpandLabel(secret []byte, label string, length int) []byte {

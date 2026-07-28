@@ -9,7 +9,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/constant"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -121,7 +120,7 @@ func asPacket(data string) constant.PacketAdapter {
 
 const fakeHost = "fake.host.com"
 
-func testQUICSniffer(data []string, async bool) (string, string, error) {
+func testQUICSniffer(data []string, async, staleInitialKeys bool) (string, string, error) {
 	q, err := NewQUICSniffer(SnifferConfig{})
 	if err != nil {
 		return "", "", err
@@ -133,6 +132,21 @@ func testQUICSniffer(data []string, async bool) (string, string, error) {
 	sender := q.WrapperSender(emptySender, func(metadata *constant.Metadata, host string) {
 		replaceDomain(metadata, host, true)
 	})
+	if staleInitialKeys {
+		packet, err := hex.DecodeString(data[0])
+		if err != nil {
+			return "", "", err
+		}
+		if len(packet) < 5 {
+			return "", "", ErrNoClue
+		}
+		packetSender := sender.(*quicPacketSender)
+		structure, err := packetSender.getQUICStructure(packet[1:5])
+		if err != nil {
+			return "", "", err
+		}
+		packetSender.initialLabels([]byte("stale initial dcid"), structure)
+	}
 
 	go func() {
 		meta := constant.Metadata{Host: fakeHost}
@@ -255,15 +269,22 @@ func TestQUICHeaders(t *testing.T) {
 
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
-			for _, mode := range []struct {
-				name  string
-				async bool
+			modes := []struct {
+				name             string
+				async            bool
+				staleInitialKeys bool
 			}{
 				{name: "async", async: true},
 				{name: "sync", async: false},
-			} {
+				{name: "after retry", staleInitialKeys: true},
+				{name: "after retry async", async: true, staleInitialKeys: true},
+			}
+			if test.invalid {
+				modes = modes[:2]
+			}
+			for _, mode := range modes {
 				t.Run(mode.name, func(t *testing.T) {
-					data, host, err := testQUICSniffer(test.input, mode.async)
+					data, host, err := testQUICSniffer(test.input, mode.async, mode.staleInitialKeys)
 					require.NoError(t, err)
 					assert.Equal(t, test.domain, data)
 					if test.invalid {
@@ -279,12 +300,46 @@ func TestQUICHeaders(t *testing.T) {
 	t.Run("client hello followed by crypto data", func(t *testing.T) {
 		clientHello := makeTestClientHello("example.com", 0)
 		cryptoData := append(bytes.Clone(clientHello), 0x02, 0, 0, 0)
-		q := &quicPacketSender{
-			buffer: cryptoData,
-			ranges: utils.IntRanges[uint64]{
-				utils.NewRange(uint64(0), uint64(len(cryptoData))),
-			},
+		q := &quicPacketSender{done: make(chan struct{})}
+		t.Cleanup(q.close)
+		require.NoError(t, q.addCryptoData(0, cryptoData))
+
+		domain, err := q.tryAssemble()
+		require.NoError(t, err)
+		assert.Equal(t, "example.com", domain)
+	})
+
+	t.Run("one byte gap remains incomplete", func(t *testing.T) {
+		clientHello := makeTestClientHello("example.com", 0)
+		q := &quicPacketSender{done: make(chan struct{})}
+		t.Cleanup(q.close)
+
+		require.NoError(t, q.addCryptoData(0, clientHello[:1]))
+		require.NoError(t, q.addCryptoData(2, clientHello[2:]))
+		domain, err := q.tryAssemble()
+		require.NoError(t, err)
+		assert.Empty(t, domain)
+		assert.Equal(t, uint64(1), q.contiguousCryptoEnd)
+
+		require.NoError(t, q.addCryptoData(1, clientHello[1:2]))
+		domain, err = q.tryAssemble()
+		require.NoError(t, err)
+		assert.Equal(t, "example.com", domain)
+	})
+
+	t.Run("many sparse fragments", func(t *testing.T) {
+		clientHello := makeTestClientHello("example.com", 4*1024)
+		q := &quicPacketSender{done: make(chan struct{})}
+		t.Cleanup(q.close)
+
+		for i := 0; i < len(clientHello); i += 2 {
+			require.NoError(t, q.addCryptoData(uint64(i), clientHello[i:i+1]))
 		}
+		assert.Equal(t, uint64(1), q.contiguousCryptoEnd)
+		for i := 1; i < len(clientHello); i += 2 {
+			require.NoError(t, q.addCryptoData(uint64(i), clientHello[i:i+1]))
+		}
+
 		domain, err := q.tryAssemble()
 		require.NoError(t, err)
 		assert.Equal(t, "example.com", domain)
@@ -306,11 +361,35 @@ func TestQUICHeaders(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, "example.com", domain)
 	})
+
+	t.Run("server name before client hello padding", func(t *testing.T) {
+		const paddingLen = 20 * 1024
+		clientHello := makeTestClientHello("example.com", paddingLen)
+		prefixLen := len(clientHello) - (4 + paddingLen)
+		q := &quicPacketSender{done: make(chan struct{})}
+		t.Cleanup(q.close)
+
+		require.NoError(t, q.addCryptoData(0, clientHello[:prefixLen]))
+		assert.Less(t, q.contiguousCryptoEnd, uint64(len(clientHello)))
+
+		domain, err := q.tryAssemble()
+		require.NoError(t, err)
+		assert.Equal(t, "example.com", domain)
+	})
 }
 
 func TestTLSHeaders(t *testing.T) {
 	generatedHello := makeTestClientHello("example.com", 0)
 	generatedHelloWithTrailingData := append(bytes.Clone(generatedHello), 0x02, 0, 0, 0)
+	const paddingLen = 4 * 1024
+	paddedHello := makeTestClientHello("example.com", paddingLen)
+	paddedPrefixLen := len(paddedHello) - (4 + paddingLen)
+	paddedRecord := makeTestTLSRecords(paddedHello)
+	paddedRecord = paddedRecord[:tlsRecordHeaderLen+paddedPrefixLen]
+	fragmentedPaddedRecord := makeTestTLSRecords(paddedHello, 2)
+	fragmentedPaddedRecord = fragmentedPaddedRecord[:2*tlsRecordHeaderLen+paddedPrefixLen]
+	incompleteTrailingRecord := makeTestTLSRecords(generatedHelloWithTrailingData)
+	incompleteTrailingRecord = incompleteTrailingRecord[:tlsRecordHeaderLen+len(generatedHello)]
 	cases := []struct {
 		name   string
 		input  []byte
@@ -460,6 +539,21 @@ func TestTLSHeaders(t *testing.T) {
 			input:  makeTestTLSRecords(generatedHelloWithTrailingData, 2),
 			domain: "example.com",
 		},
+		{
+			name:   "server name before client hello padding",
+			input:  paddedRecord,
+			domain: "example.com",
+		},
+		{
+			name:   "server name across records before padding",
+			input:  fragmentedPaddedRecord,
+			domain: "example.com",
+		},
+		{
+			name:   "client hello before incomplete record tail",
+			input:  incompleteTrailingRecord,
+			domain: "example.com",
+		},
 	}
 
 	for _, test := range cases {
@@ -487,7 +581,8 @@ func TestTLSHeaders(t *testing.T) {
 		{name: "two byte record header", have: 2, need: tlsRecordHeaderLen},
 		{name: "three byte record header", have: 3, need: tlsRecordHeaderLen},
 		{name: "four byte record header", have: 4, need: tlsRecordHeaderLen},
-		{name: "record payload missing", have: tlsRecordHeaderLen, need: tlsRecordHeaderLen + 2},
+		{name: "record payload missing", have: tlsRecordHeaderLen, need: tlsRecordHeaderLen + 1},
+		{name: "handshake type only", have: tlsRecordHeaderLen + 1, need: tlsRecordHeaderLen + 2},
 		{name: "next record header missing", have: tlsRecordHeaderLen + 2, need: 2*tlsRecordHeaderLen + 2},
 		{name: "final record payload incomplete", have: len(fragmented) - 1, need: len(fragmented)},
 	} {
@@ -498,47 +593,288 @@ func TestTLSHeaders(t *testing.T) {
 			assert.Equal(t, test.need, need.length)
 		})
 	}
+
+	t.Run("rejects oversized record before its payload", func(t *testing.T) {
+		input := []byte{tlsRecordTypeHandshake, 0x03, 0x01, 0x40, 0x01}
+		_, err := SniffTLS(input)
+		assert.ErrorIs(t, err, errNotTLS)
+		var need *errNeedAtLeastData
+		assert.NotErrorAs(t, err, &need)
+	})
+
+	t.Run("rejects another handshake type before record completion", func(t *testing.T) {
+		input := []byte{tlsRecordTypeHandshake, 0x03, 0x01, 0x40, 0x00, 0x02}
+		_, err := SniffTLS(input)
+		assert.ErrorIs(t, err, errNotClientHello)
+		var need *errNeedAtLeastData
+		assert.NotErrorAs(t, err, &need)
+	})
+
+	t.Run("rejects invalid client hello prefix before record completion", func(t *testing.T) {
+		clientHello := make([]byte, 39)
+		clientHello[0] = tlsHandshakeTypeClientHello
+		clientHello[2] = 0x03
+		clientHello[3] = 0xe8 // declared body length: 1000 bytes
+		clientHello[38] = 33  // legacy_session_id exceeds its 32-byte limit
+		input := []byte{tlsRecordTypeHandshake, 0x03, 0x01, 0x03, 0xec}
+		input = append(input, clientHello...)
+
+		_, err := SniffTLS(input)
+		assert.ErrorIs(t, err, errNotClientHello)
+		var need *errNeedAtLeastData
+		assert.NotErrorAs(t, err, &need)
+	})
 }
 
 func TestHTTPHeaders(t *testing.T) {
+	domain := "example.com"
+	headerBlock := append([]byte{0x41, byte(len(domain))}, domain...)
+	const (
+		firstSplit  = 4
+		secondSplit = 9
+	)
+
 	cases := []struct {
+		name   string
 		input  []byte
 		domain string
 		err    bool
 	}{
 		{
+			name:   "http1 origin form",
 			input:  []byte("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"),
 			domain: "example.com",
 		},
 		{
+			name:   "http1 uppercase host",
+			input:  []byte("GET / HTTP/1.1\r\nHost: EXAMPLE.COM\r\n\r\n"),
+			domain: "example.com",
+		},
+		{
+			name:   "http1 host before end of headers",
+			input:  []byte("GET / HTTP/1.1\r\nHost: example.com\r\nX-Large: "),
+			domain: "example.com",
+		},
+		{
+			name:   "http1 absolute form",
 			input:  []byte("GET http://example.com/path HTTP/1.1\r\n\r\n"),
 			domain: "example.com",
 		},
 		{
+			name:  "http1 ip host",
 			input: []byte("GET / HTTP/1.1\r\nHost: 1.2.3.4\r\n\r\n"),
 			err:   true,
 		},
 		{
-			input: []byte{
-				0x50, 0x52, 0x49, 0x20, 0x2a, 0x20, 0x48, 0x54,
-				0x54, 0x50, 0x2f, 0x32, 0x2e, 0x30, 0x0d, 0x0a,
-				0x0d, 0x0a, 0x53, 0x4d, 0x0d, 0x0a, 0x0d, 0x0a,
-				0x00, 0x00, 0x0d, 0x01, 0x04, 0x00, 0x00, 0x00, 0x01,
-				0x41, 0x0b,
-				0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d,
-			},
-			domain: "example.com",
+			name: "http2 single headers frame",
+			input: makeTestHTTP2Input(
+				makeTestHTTP2Frame(h2FrameHeaders, h2FlagEndHeaders, 1, headerBlock),
+			),
+			domain: domain,
+		},
+		{
+			name: "http2 continuations",
+			input: makeTestHTTP2Input(
+				makeTestHTTP2Frame(h2FrameHeaders, 0, 1, headerBlock[:firstSplit]),
+				makeTestHTTP2Frame(h2FrameContinuation, 0, 1, headerBlock[firstSplit:secondSplit]),
+				makeTestHTTP2Frame(h2FrameContinuation, h2FlagEndHeaders, 1, headerBlock[secondSplit:]),
+			),
+			domain: domain,
+		},
+		{
+			name: "http2 continuation on another stream",
+			input: makeTestHTTP2Input(
+				makeTestHTTP2Frame(h2FrameHeaders, 0, 1, headerBlock[:firstSplit]),
+				makeTestHTTP2Frame(h2FrameContinuation, h2FlagEndHeaders, 3, headerBlock[firstSplit:]),
+			),
+			err: true,
+		},
+		{
+			name: "http2 interleaved frame",
+			input: makeTestHTTP2Input(
+				makeTestHTTP2Frame(h2FrameHeaders, 0, 1, headerBlock[:firstSplit]),
+				makeTestHTTP2Frame(0x4, 0, 0, nil), // SETTINGS
+				makeTestHTTP2Frame(h2FrameContinuation, h2FlagEndHeaders, 1, headerBlock[firstSplit:]),
+			),
+			err: true,
+		},
+		{
+			name: "http2 authority before incomplete frame payload",
+			input: func() []byte {
+				frame := makeTestHTTP2Frame(h2FrameHeaders, h2FlagEndHeaders, 1,
+					append(bytes.Clone(headerBlock), make([]byte, 1024)...))
+				return makeTestHTTP2Input(frame[:h2FrameHeaderLen+len(headerBlock)])
+			}(),
+			domain: domain,
+		},
+		{
+			name: "http2 authority before invalid trailing hpack",
+			input: makeTestHTTP2Input(
+				makeTestHTTP2Frame(h2FrameHeaders, h2FlagEndHeaders, 1,
+					append(bytes.Clone(headerBlock), 0x80)), // indexed field with index zero
+			),
+			domain: domain,
 		},
 	}
 
 	for _, test := range cases {
-		h, _ := NewHTTPSniffer(SnifferConfig{})
-		domain, err := h.SniffData(test.input)
-		if test.err {
-			assert.Error(t, err)
-		} else {
-			assert.NoError(t, err)
-			assert.Equal(t, test.domain, domain)
-		}
+		t.Run(test.name, func(t *testing.T) {
+			h, err := NewHTTPSniffer(SnifferConfig{})
+			require.NoError(t, err)
+			domain, err := h.SniffData(test.input)
+			if test.err {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, test.domain, domain)
+			}
+		})
 	}
+
+	t.Run("http1 rejects non-http prefix", func(t *testing.T) {
+		h, err := NewHTTPSniffer(SnifferConfig{})
+		require.NoError(t, err)
+		_, err = h.SniffData([]byte{0x16, 0x03, 0x01, 0x00, 0x20})
+		assert.ErrorIs(t, err, errNotHTTP)
+	})
+
+	t.Run("http1 waits for a partial method", func(t *testing.T) {
+		h, err := NewHTTPSniffer(SnifferConfig{})
+		require.NoError(t, err)
+		_, err = h.SniffData([]byte("GE"))
+		var need *errNeedAtLeastData
+		require.ErrorAs(t, err, &need)
+		assert.Equal(t, 3, need.length)
+	})
+
+	t.Run("http1 waits for a complete host line", func(t *testing.T) {
+		input := []byte("GET / HTTP/1.1\r\nHost: example")
+		h, err := NewHTTPSniffer(SnifferConfig{})
+		require.NoError(t, err)
+		_, err = h.SniffData(input)
+		var need *errNeedAtLeastData
+		require.ErrorAs(t, err, &need)
+		assert.Equal(t, len(input)+1, need.length)
+	})
+
+	t.Run("http2 reads the preface incrementally", func(t *testing.T) {
+		for _, test := range []struct {
+			name  string
+			input []byte
+		}{
+			{name: "first byte", input: h2ClientPreface[:1]},
+			{name: "partial method", input: h2ClientPreface[:3]},
+			{name: "last byte missing", input: h2ClientPreface[:len(h2ClientPreface)-1]},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				h, err := NewHTTPSniffer(SnifferConfig{})
+				require.NoError(t, err)
+				_, err = h.SniffData(test.input)
+				var need *errNeedAtLeastData
+				require.ErrorAs(t, err, &need)
+				assert.Equal(t, len(test.input)+1, need.length)
+			})
+		}
+	})
+
+	t.Run("http2 rejects invalid frame headers before payload", func(t *testing.T) {
+		frameHeader := func(frameType, flags byte, streamID uint32, length int) []byte {
+			frame := makeTestHTTP2Frame(frameType, flags, streamID, make([]byte, length))
+			return frame[:h2FrameHeaderLen]
+		}
+		for _, test := range []struct {
+			name  string
+			input []byte
+		}{
+			{
+				name: "first frame is not settings",
+				input: append(bytes.Clone(h2ClientPreface),
+					frameHeader(0x0, 0, 1, 1024)...), // DATA
+			},
+			{
+				name: "first settings is an ack",
+				input: append(bytes.Clone(h2ClientPreface),
+					frameHeader(h2FrameSettings, h2FlagAck, 0, 0)...),
+			},
+			{
+				name:  "frame exceeds default maximum",
+				input: makeTestHTTP2Input(frameHeader(h2FrameHeaders, 0, 1, h2DefaultMaxFrameSize+1)),
+			},
+			{
+				name: "invalid settings length",
+				input: append(bytes.Clone(h2ClientPreface),
+					frameHeader(h2FrameSettings, 0, 0, 1)...),
+			},
+			{
+				name:  "unexpected continuation",
+				input: makeTestHTTP2Input(frameHeader(h2FrameContinuation, 0, 1, 1024)),
+			},
+			{
+				name:  "headers on stream zero",
+				input: makeTestHTTP2Input(frameHeader(h2FrameHeaders, 0, 0, 1024)),
+			},
+			{
+				name: "interleaved frame",
+				input: makeTestHTTP2Input(
+					makeTestHTTP2Frame(h2FrameHeaders, 0, 1, headerBlock[:firstSplit]),
+					frameHeader(h2FrameSettings, 0, 0, 0),
+				),
+			},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				h, err := NewHTTPSniffer(SnifferConfig{})
+				require.NoError(t, err)
+				_, err = h.SniffData(test.input)
+				assert.ErrorIs(t, err, ErrNoClue)
+				var need *errNeedAtLeastData
+				assert.NotErrorAs(t, err, &need)
+			})
+		}
+	})
+
+	t.Run("http2 continuation header missing", func(t *testing.T) {
+		input := makeTestHTTP2Input(
+			makeTestHTTP2Frame(h2FrameHeaders, 0, 1, headerBlock[:firstSplit]),
+		)
+		h, err := NewHTTPSniffer(SnifferConfig{})
+		require.NoError(t, err)
+		_, err = h.SniffData(input)
+		var need *errNeedAtLeastData
+		require.ErrorAs(t, err, &need)
+		assert.Equal(t, len(input)+h2FrameHeaderLen, need.length)
+	})
+
+	t.Run("http2 continuation payload incomplete", func(t *testing.T) {
+		complete := makeTestHTTP2Input(
+			makeTestHTTP2Frame(h2FrameHeaders, 0, 1, headerBlock[:firstSplit]),
+			makeTestHTTP2Frame(h2FrameContinuation, h2FlagEndHeaders, 1, headerBlock[firstSplit:]),
+		)
+		h, err := NewHTTPSniffer(SnifferConfig{})
+		require.NoError(t, err)
+		_, err = h.SniffData(complete[:len(complete)-1])
+		var need *errNeedAtLeastData
+		require.ErrorAs(t, err, &need)
+		assert.Equal(t, len(complete), need.length)
+	})
+}
+
+func makeTestHTTP2Frame(frameType, flags byte, streamID uint32, payload []byte) []byte {
+	frame := make([]byte, h2FrameHeaderLen+len(payload))
+	frame[0] = byte(len(payload) >> 16)
+	frame[1] = byte(len(payload) >> 8)
+	frame[2] = byte(len(payload))
+	frame[3] = frameType
+	frame[4] = flags
+	binary.BigEndian.PutUint32(frame[5:9], streamID)
+	copy(frame[h2FrameHeaderLen:], payload)
+	return frame
+}
+
+func makeTestHTTP2Input(frames ...[]byte) []byte {
+	input := bytes.Clone(h2ClientPreface)
+	input = append(input, makeTestHTTP2Frame(h2FrameSettings, 0, 0, nil)...)
+	for _, frame := range frames {
+		input = append(input, frame...)
+	}
+	return input
 }
