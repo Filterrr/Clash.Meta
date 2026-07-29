@@ -311,6 +311,11 @@ func sniffHTTP2(b []byte) (string, error) {
 				return "", ErrNoClue
 			}
 		}
+		if flags&h2FlagEndHeaders != 0 && (fragmentStart == fragmentEnd || availableEnd == fragmentEnd) {
+			// The HPACK fragment is complete or known to be empty. Trailing frame
+			// padding cannot contain a host and therefore cannot change the verdict.
+			return "", ErrNoClue
+		}
 
 		if len(b) < length {
 			want := payloadOffset + length
@@ -325,14 +330,7 @@ func sniffHTTP2(b []byte) (string, error) {
 			return "", &errNeedAtLeastData{length: want, err: ErrNoClue}
 		}
 		b = b[length:]
-
-		if flags&h2FlagEndHeaders == 0 {
-			continue
-		}
-		if err := decoder.Close(); err != nil {
-			return "", ErrNoClue
-		}
-		return "", ErrNoClue
+		continue
 	}
 }
 

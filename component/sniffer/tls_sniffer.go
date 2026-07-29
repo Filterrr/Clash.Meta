@@ -211,6 +211,11 @@ func ReadClientHello(data []byte) (*string, error) {
 				offset = nameEnd
 			}
 		} else {
+			if extensionEnd == extensionsEnd {
+				// This is the last extension, so its payload cannot contain a
+				// later server_name extension that changes the verdict.
+				return nil, errNotTLS
+			}
 			if err := need(extensionEnd); err != nil {
 				return nil, err
 			}
