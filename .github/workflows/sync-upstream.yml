@@ -66,19 +66,16 @@ jobs:
             echo "Merge conflicts detected, resolving..."
             CONFLICTED=$(git diff --name-only --diff-filter=U)
             echo "Conflicted files: $CONFLICTED"
+            # FlClash adaptation patches are re-applied from a clean upstream
+            # base by the patch script in the next step, so every conflict is
+            # resolved by taking the upstream version ("theirs"). The patch
+            # script then regenerates FlClash-specific modifications on top,
+            # and the subsequent "Verify Go build" step catches any patch
+            # pattern that no longer matches the new upstream code.
             for file in $CONFLICTED; do
-              case "$file" in
-                go.mod|go.sum)
-                  echo "Resolving conflict in $file: accepting upstream version"
-                  git checkout --theirs "$file"
-                  git add "$file"
-                  ;;
-                *)
-                  echo "ERROR: Unresolvable conflict in $file"
-                  git diff --name-only --diff-filter=U
-                  exit 1
-                  ;;
-              esac
+              echo "Resolving conflict in $file: accepting upstream version"
+              git checkout --theirs "$file" 2>/dev/null || git rm "$file"
+              git add "$file" 2>/dev/null || true
             done
             echo "Running 'go mod tidy' to regenerate go.sum..."
             go mod tidy
