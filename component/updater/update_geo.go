@@ -196,19 +196,26 @@ func UpdateGeoDatabases() error {
 	log.Infoln("[GEO] Start updating GEO database")
 
 	if updatingGeo.Load() {
+		sendGeoUpdateStatus("geo", false, true, nil)
 		return ErrGetDatabaseUpdateSkip
 	}
 
 	updatingGeo.Store(true)
-	defer updatingGeo.Store(false)
+	sendGeoUpdateStatus("geo", true, false, nil)
+	defer func() {
+		updatingGeo.Store(false)
+		sendGeoUpdateStatus("geo", false, false, nil)
+	}()
 
 	log.Infoln("[GEO] Updating GEO database")
 
 	if err := updateGeoDatabases(); err != nil {
 		log.Errorln("[GEO] update GEO database error: %s", err.Error())
+		sendGeoUpdateStatus("geo", false, false, err)
 		return err
 	}
 
+	sendGeoUpdateStatus("geo", false, false, nil)
 	return nil
 }
 
