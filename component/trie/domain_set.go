@@ -157,23 +157,26 @@ func (ss *DomainSet) Has(key string) bool {
 		c := revLowerAt(key, i)
 		for ; ; bmIdx++ {
 			if getBit(ss.labelBitmap, bmIdx) != 0 {
-				if len(stack) > 0 {
+				for len(stack) > 0 {
 					cursor := stack[len(stack)-1]
 					stack = stack[0 : len(stack)-1]
 					// back wildcard and find next node
 					nextNodeId := countZeros(ss.labelBitmap, ss.ranks, cursor.bmIdx+1)
-					nextBmIdx := selectIthOne(ss.labelBitmap, ss.ranks, ss.selects, nextNodeId-1) + 1
 					j := cursor.index
 					for ; j < len(key) && revLowerAt(key, j) != domainStepByte; j++ {
 					}
 					if j == len(key) {
 						if getBit(ss.leaves, nextNodeId) != 0 {
+							// The wildcard consumed the rest of the key and reached a
+							// terminal node, so this branch matches.
 							return true
-						} else {
-							goto RESTART
 						}
+						// Otherwise, this node is not terminal and this wildcard branch
+						// has no input left for child edges. Try any remaining saved wildcards.
+						continue
 					}
-					for ; nextBmIdx-nextNodeId < len(ss.labels); nextBmIdx++ {
+					nextBmIdx := selectIthOne(ss.labelBitmap, ss.ranks, ss.selects, nextNodeId-1) + 1
+					for ; getBit(ss.labelBitmap, nextBmIdx) == 0; nextBmIdx++ {
 						if ss.labels[nextBmIdx-nextNodeId] == domainStepByte {
 							bmIdx = nextBmIdx
 							nodeId = nextNodeId
@@ -196,7 +199,20 @@ func (ss *DomainSet) Has(key string) bool {
 				break
 			}
 		}
-		nodeId = countZeros(ss.labelBitmap, ss.ranks, bmIdx+1)
+		nodeId = bmIdx - nodeId + 1 // countZeros(ss.labelBitmap, ss.ranks, bmIdx+1)
+		if i == len(key)-1 {
+			if getBit(ss.leaves, nodeId) != 0 {
+				// All input is consumed at a terminal node, so the key matches.
+				return true
+			}
+			if len(stack) == 0 {
+				// No input remains for this non-terminal node's child edges.
+				// With no saved wildcard branches left, the key cannot match.
+				return false
+			}
+			bmIdx = selectIthOne(ss.labelBitmap, ss.ranks, ss.selects, nodeId)
+			goto RESTART
+		}
 		bmIdx = selectIthOne(ss.labelBitmap, ss.ranks, ss.selects, nodeId-1) + 1
 	}
 
@@ -238,7 +254,7 @@ func (ss *DomainSet) keys(f func(key string) bool) {
 			}
 			nextLabel := ss.labels[bmIdx-nodeId]
 			currentKey = append(currentKey, nextLabel)
-			nextNodeId := countZeros(ss.labelBitmap, ss.ranks, bmIdx+1)
+			nextNodeId := bmIdx - nodeId + 1 // countZeros(ss.labelBitmap, ss.ranks, bmIdx+1)
 			nextBmIdx := selectIthOne(ss.labelBitmap, ss.ranks, ss.selects, nextNodeId-1) + 1
 			if !traverse(nextNodeId, nextBmIdx) {
 				return false
