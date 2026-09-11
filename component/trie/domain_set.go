@@ -25,7 +25,7 @@ type DomainSet struct {
 	ranks, selects      []int32
 }
 
-type qElt struct{ s, e, col int }
+type qElt struct{ s, e int }
 
 // DomainSetBuilder incrementally collects domain patterns for a DomainSet.
 // Its zero value is ready to use.
@@ -75,20 +75,25 @@ func (b *DomainSetBuilder) Build() *DomainSet {
 	}
 	keys := b.keys
 	b.keys = nil
-	return buildDomainSet(keys)
+	return buildDomainSet(keys, nil)
 }
 
 // NewDomainSet creates a new *DomainSet struct, from a DomainTrie.
 func (t *DomainTrie[T]) NewDomainSet() *DomainSet {
 	keys := make([]string, 0)
 	t.Foreach(func(domain string, _ T) bool {
+		if domain[0] == domainStepByte {
+			// Suffix-only patterns need an explicit '+' wildcard marker in
+			// the internal key; a leading dot alone is only a label separator.
+			domain = complexWildcard + domain
+		}
 		keys = append(keys, utils.Reverse(domain))
 		return true
 	})
-	return buildDomainSet(keys)
+	return buildDomainSet(keys, nil)
 }
 
-func buildDomainSet(keys []string) *DomainSet {
+func buildDomainSet(keys []string, onTerminal func(string)) *DomainSet {
 	if len(keys) == 0 {
 		return nil
 	}
@@ -102,28 +107,35 @@ func buildDomainSet(keys []string) *DomainSet {
 	ss := &DomainSet{}
 	lIdx := 0
 
-	queue := []qElt{{0, len(keys), 0}}
-	for i := 0; i < len(queue); i++ {
-		elt := queue[i]
-		if elt.col == len(keys[elt.s]) {
-			elt.s++
-			// a leaf node
-			setBit(&ss.leaves, i, 1)
-		}
-
-		for j := elt.s; j < elt.e; {
-
-			frm := j
-
-			for ; j < elt.e && keys[j][elt.col] == keys[frm][elt.col]; j++ {
+	nodeID := 0
+	queue := make([]qElt, 1, len(keys))
+	queue[0] = qElt{0, len(keys)}
+	next := make([]qElt, 0, len(keys))
+	for col := 0; len(queue) > 0; col++ {
+		for _, elt := range queue {
+			if col == len(keys[elt.s]) {
+				if onTerminal != nil {
+					onTerminal(keys[elt.s])
+				}
+				elt.s++
+				// a leaf node
+				setBit(&ss.leaves, nodeID, 1)
 			}
-			queue = append(queue, qElt{frm, j, elt.col + 1})
-			ss.labels = append(ss.labels, keys[frm][elt.col])
-			setBit(&ss.labelBitmap, lIdx, 0)
+
+			for j := elt.s; j < elt.e; {
+				frm := j
+				for ; j < elt.e && keys[j][col] == keys[frm][col]; j++ {
+				}
+				next = append(next, qElt{frm, j})
+				ss.labels = append(ss.labels, keys[frm][col])
+				setBit(&ss.labelBitmap, lIdx, 0)
+				lIdx++
+			}
+			setBit(&ss.labelBitmap, lIdx, 1)
 			lIdx++
+			nodeID++
 		}
-		setBit(&ss.labelBitmap, lIdx, 1)
-		lIdx++
+		queue, next = next, queue[:0]
 	}
 
 	ss.init()
@@ -238,12 +250,12 @@ func byteReverse(s string) string {
 	return string(buf)
 }
 
-func (ss *DomainSet) keys(f func(key string) bool) {
+func (ss *DomainSet) keys(f func(key string, nodeId int) bool) {
 	var currentKey []byte
 	var traverse func(int, int) bool
 	traverse = func(nodeId, bmIdx int) bool {
 		if getBit(ss.leaves, nodeId) != 0 {
-			if !f(string(currentKey)) {
+			if !f(string(currentKey), nodeId) {
 				return false
 			}
 		}
@@ -267,9 +279,16 @@ func (ss *DomainSet) keys(f func(key string) bool) {
 	return
 }
 
+// Foreach iterates over the stored domain patterns in unspecified order.
+// Patterns use lowercase labels, "*" for a single-label wildcard, and a leading
+// "." for subdomain-only matching. Exact and suffix-only patterns are separate
+// entries; "+." shorthand is not emitted. Each pattern can be passed to
+// DomainSetBuilder.Insert independently to reproduce the set.
 func (ss *DomainSet) Foreach(f func(key string) bool) {
-	ss.keys(func(key string) bool {
-		return f(utils.Reverse(key))
+	ss.keys(func(key string, _ int) bool {
+		// Internal keys are reversed, with a trailing '+' for suffix wildcards.
+		// Removing that marker leaves the leading-dot syntax after reversal.
+		return f(utils.Reverse(strings.TrimSuffix(key, complexWildcard)))
 	})
 }
 
